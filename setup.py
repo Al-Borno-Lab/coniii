@@ -36,10 +36,8 @@ import platform, sys
 NO_BOOST = False
 
 # default args (that are modified per system specs below)
-EXTRA_COMPILE_ARGS = ['-std=c++11',f'-I{os.environ["CONDA_PREFIX"]}/include']
-if 'CONDA_PREFIX' in os.environ:
-    # includes places to search for boost lib
-    DEFAULT_LIBRARY_DR = [f'{os.environ["CONDA_PREFIX"]}/include']
+EXTRA_COMPILE_ARGS = ['-std=c++11',f'-I{sys.prefix}/include']
+DEFAULT_LIBRARY_DR = [f'{sys.prefix}/include']
 
 # setup
 here = path.abspath(path.dirname(__file__))
