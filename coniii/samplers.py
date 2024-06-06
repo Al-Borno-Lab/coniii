@@ -377,7 +377,7 @@ class WolffIsing(Sampler):
         return neighbors
 
 # Helper functions for WolffIsing.
-@jit
+@jit(nopython=True)
 def iterate_neighbors(n,ix,expdJ,r):
     """Iterate through all neighbors of a particular site and see if a bond should be
     formed between them.
@@ -2338,7 +2338,7 @@ class Heisenberg3DSampler(Sampler):
 # ---------------------#
 # Helper functions. #
 # ---------------------#
-@jit
+@jit(nopython=True)
 def cross(vec1, vec2):
     """ Calculate the cross product of two 3d vectors. """
     result = np.zeros((3))
