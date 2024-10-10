@@ -30,8 +30,8 @@ import copy
 import numpy as np
 #import scipy.weave # for efficient fourth-order matrix calculation
 
-exp, cosh = scipy.exp, scipy.cosh
-dot = scipy.dot
+exp, cosh = np.exp, np.cosh
+dot = np.dot
 
 # 4.8.2011
 # 8.16.2012 moved from generateFightData.py
