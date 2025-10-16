@@ -24,11 +24,13 @@ from .solvers import MCH,MPF,Pseudo,ClusterExpansion,Enumerate,RegularizedMeanFi
 from .utils import *
 from .version import version as __version__
 
-# Import Rust extension functions
+# Import Rust extension functions and classes
 try:
     from . import coniii as _rust_module
-    # Make Rust functions available at package level
+    # Make Rust functions and classes available at package level
     sum_as_string = _rust_module.sum_as_string
+    Ising = _rust_module.Ising
+    Potts3 = _rust_module.Potts3
 except ImportError:
     # Rust module not available (e.g., during development)
     pass
