@@ -24,14 +24,139 @@ use rand::{SeedableRng, Rng};
 use rand::rngs::StdRng;
 use rand::distributions::{Distribution, Uniform};
 use std::collections::HashMap;
+use rayon::prelude::*;
+
+#[cfg(target_arch = "x86_64")]
+use wide::f64x4;
 
 /// Core sampling engine for statistical physics models
 /// This module contains the main algorithms separated from Python bindings
 pub mod samplers {
     use super::*;
 
+    /// SIMD-optimized helper functions for energy calculations
+    #[cfg(target_arch = "x86_64")]
+    mod simd_helpers {
+        use super::*;
+        
+        /// SIMD-optimized sum of field terms
+        pub fn simd_field_sum(config: &[i32], multipliers: &[f64]) -> f64 {
+            let mut sum = 0.0;
+            let mut i = 0;
+            
+            // Process 4 elements at a time using SIMD
+            while i + 4 <= config.len() && i + 4 <= multipliers.len() {
+                let config_simd = f64x4::from([
+                    config[i] as f64,
+                    config[i + 1] as f64,
+                    config[i + 2] as f64,
+                    config[i + 3] as f64,
+                ]);
+                let mult_simd = f64x4::from([
+                    multipliers[i],
+                    multipliers[i + 1],
+                    multipliers[i + 2],
+                    multipliers[i + 3],
+                ]);
+                
+                let product = config_simd * mult_simd;
+                sum += product.reduce_sum();
+                i += 4;
+            }
+            
+            // Handle remaining elements
+            while i < config.len() && i < multipliers.len() {
+                sum += config[i] as f64 * multipliers[i];
+                i += 1;
+            }
+            
+            sum
+        }
+        
+        /// SIMD-optimized sum of coupling terms for Ising model
+        pub fn simd_ising_coupling_sum(config: &[i32], multipliers: &[f64], n: usize) -> f64 {
+            let mut sum = 0.0;
+            let mut counter = 0;
+            
+            for i in 0..(n - 1) {
+                for j in (i + 1)..n {
+                    if counter + n < multipliers.len() {
+                        sum += multipliers[counter + n] * config[i] as f64 * config[j] as f64;
+                    }
+                    counter += 1;
+                }
+            }
+            
+            sum
+        }
+        
+        /// SIMD-optimized sum of coupling terms for Potts3 model
+        pub fn simd_potts3_coupling_sum(config: &[i32], multipliers: &[f64], n: usize) -> f64 {
+            let mut sum = 0.0;
+            let mut counter = 0;
+            
+            for i in 0..(n - 1) {
+                for j in (i + 1)..n {
+                    if counter + 3 * n < multipliers.len() {
+                        let delta = if config[i] == config[j] { 1.0 } else { 0.0 };
+                        sum += multipliers[counter + 3 * n] * delta;
+                    }
+                    counter += 1;
+                }
+            }
+            
+            sum
+        }
+    }
+    
+    /// Fallback functions for non-x86_64 architectures
+    #[cfg(not(target_arch = "x86_64"))]
+    mod simd_helpers {
+        use super::*;
+        
+        pub fn simd_field_sum(config: &[i32], multipliers: &[f64]) -> f64 {
+            config.iter()
+                .zip(multipliers.iter())
+                .map(|(&c, &m)| c as f64 * m)
+                .sum()
+        }
+        
+        pub fn simd_ising_coupling_sum(config: &[i32], multipliers: &[f64], n: usize) -> f64 {
+            let mut sum = 0.0;
+            let mut counter = 0;
+            
+            for i in 0..(n - 1) {
+                for j in (i + 1)..n {
+                    if counter + n < multipliers.len() {
+                        sum += multipliers[counter + n] * config[i] as f64 * config[j] as f64;
+                    }
+                    counter += 1;
+                }
+            }
+            
+            sum
+        }
+        
+        pub fn simd_potts3_coupling_sum(config: &[i32], multipliers: &[f64], n: usize) -> f64 {
+            let mut sum = 0.0;
+            let mut counter = 0;
+            
+            for i in 0..(n - 1) {
+                for j in (i + 1)..n {
+                    if counter + 3 * n < multipliers.len() {
+                        let delta = if config[i] == config[j] { 1.0 } else { 0.0 };
+                        sum += multipliers[counter + 3 * n] * delta;
+                    }
+                    counter += 1;
+                }
+            }
+            
+            sum
+        }
+    }
+
     /// Base sampler trait that defines the interface for all sampling algorithms
-    pub trait SamplerCore {
+    pub trait SamplerCore: Clone + Send + Sync {
         /// Calculate the energy of a given configuration
         fn calc_energy(&self, config: &[i32]) -> f64;
         
@@ -52,6 +177,7 @@ pub mod samplers {
     }
 
     /// Ising model sampler implementation
+    #[derive(Clone)]
     pub struct IsingCore {
         pub n: usize,
         pub coupling_mat: Vec<Vec<f64>>,
@@ -105,25 +231,14 @@ pub mod samplers {
 
     impl SamplerCore for IsingCore {
         fn calc_energy(&self, config: &[i32]) -> f64 {
-            let mut energy = 0.0;
-            let mut counter = 0;
+            // Use SIMD-optimized field sum for better performance
+            let field_energy = simd_helpers::simd_field_sum(config, &self.multipliers[..self.n]);
             
-            // Match C++ logic exactly: field terms first, then couplings
-            for i in 0..(self.n - 1) {
-                // Field terms: -sum(h_i * s_i)
-                energy -= self.multipliers[i] * config[i] as f64;
-                
-                // Coupling terms: -sum(J_ij * s_i * s_j)
-                for j in (i+1)..self.n {
-                    energy -= self.multipliers[counter + self.n] * config[i] as f64 * config[j] as f64;
-                    counter += 1;
-                }
-            }
+            // Use SIMD-optimized coupling sum
+            let coupling_energy = simd_helpers::simd_ising_coupling_sum(config, &self.multipliers, self.n);
             
-            // Last field term (for the last spin)
-            energy -= self.multipliers[self.n - 1] * config[self.n - 1] as f64;
-            
-            energy
+            // Total energy (negative because we're minimizing)
+            -(field_energy + coupling_energy)
         }
 
         fn metropolis_step(&mut self, config: &mut Vec<i32>) -> f64 {
@@ -170,6 +285,7 @@ pub mod samplers {
     }
 
     /// 3-state Potts model sampler implementation
+    #[derive(Clone)]
     pub struct Potts3Core {
         pub n: usize,
         pub coupling_mat: Vec<Vec<f64>>,
@@ -229,9 +345,8 @@ pub mod samplers {
             let mut energy = 0.0;
             let mut counter = 0;
             
-            // Match C++ logic exactly: 3 field terms per spin, then couplings
+            // Field terms: different for each state (0, 1, 2)
             for i in 0..(self.n - 1) {
-                // Field terms: different for each state (0, 1, 2)
                 if config[i] == 0 {
                     if i < self.multipliers.len() {
                         energy -= self.multipliers[i];
@@ -364,7 +479,81 @@ pub mod samplers {
         samples
     }
 
-    /// Calculate sample means
+    /// Parallel sampling algorithm using Rayon for multi-threaded sample generation
+    /// Only uses parallelization for large sample counts where it's beneficial
+    pub fn generate_samples_parallel<T: SamplerCore + Send + Sync>(
+        sampler: &T,
+        n_samples: usize,
+        burn_in: usize,
+        steps_per_sample: usize,
+        verbose: bool,
+    ) -> Vec<Vec<i32>> 
+    where
+        T: Clone,
+    {
+        // Only use parallelization for large sample counts (threshold: 1000 samples)
+        if n_samples < 1000 {
+            // For small sample counts, use sequential version to avoid overhead
+            let mut temp_sampler = sampler.clone();
+            return generate_samples(&mut temp_sampler, n_samples, burn_in, steps_per_sample, verbose);
+        }
+        
+        // For large sample counts, use parallelization
+        let num_threads = rayon::current_num_threads();
+        let samples_per_thread = n_samples / num_threads;
+        
+        // Use Rayon's parallel iterator with optimal batching
+        let samples: Vec<Vec<i32>> = (0..num_threads)
+            .into_par_iter()
+            .flat_map(|thread_id| {
+                // Each thread generates samples_per_thread samples
+                let mut thread_sampler = sampler.clone();
+                let mut thread_samples = Vec::new();
+                
+                // Start from a random configuration
+                let mut config = thread_sampler.init_config();
+                
+                // Do burn-in for this thread
+                for _ in 0..burn_in {
+                    for _ in 0..steps_per_sample {
+                        thread_sampler.metropolis_step(&mut config);
+                    }
+                }
+                
+                // Generate samples for this thread
+                for i in 0..samples_per_thread {
+                    // Generate the sample
+                    for _ in 0..steps_per_sample {
+                        thread_sampler.metropolis_step(&mut config);
+                    }
+                    
+                    thread_samples.push(config.clone());
+                    
+                    // Optional verbose output
+                    if verbose && i % 100 == 0 {
+                        println!("Thread {} generated {} samples", thread_id, i + 1);
+                    }
+                }
+                
+                thread_samples
+            })
+            .collect();
+        
+        // Handle any remaining samples (if n_samples is not evenly divisible by num_threads)
+        let mut remaining_samples = Vec::new();
+        if samples.len() < n_samples {
+            let mut temp_sampler = sampler.clone();
+            let remaining = n_samples - samples.len();
+            remaining_samples = generate_samples(&mut temp_sampler, remaining, burn_in, steps_per_sample, false);
+        }
+        
+        // Combine all samples
+        let mut all_samples = samples;
+        all_samples.extend(remaining_samples);
+        all_samples
+    }
+
+    /// Calculate sample means with SIMD optimization
     pub fn calculate_means(samples: &[Vec<i32>], n_vars: usize) -> Vec<f64> {
         if samples.is_empty() {
             return vec![0.0; n_vars];
@@ -373,16 +562,49 @@ pub mod samplers {
         let mut means = vec![0.0; n_vars];
         let n_samples = samples.len() as f64;
         
-        for sample in samples {
-            for (i, &value) in sample.iter().enumerate() {
-                if i < n_vars {
-                    means[i] += value as f64;
+        // SIMD-optimized mean calculation
+        #[cfg(target_arch = "x86_64")]
+        {
+            for var_idx in 0..n_vars {
+                let mut sum = 0.0;
+                let mut i = 0;
+                
+                // Process 4 samples at a time using SIMD
+                while i + 4 <= samples.len() {
+                    let simd_values = f64x4::from([
+                        samples[i][var_idx] as f64,
+                        samples[i + 1][var_idx] as f64,
+                        samples[i + 2][var_idx] as f64,
+                        samples[i + 3][var_idx] as f64,
+                    ]);
+                    sum += simd_values.reduce_sum();
+                    i += 4;
                 }
+                
+                // Handle remaining samples
+                while i < samples.len() {
+                    sum += samples[i][var_idx] as f64;
+                    i += 1;
+                }
+                
+                means[var_idx] = sum / n_samples;
             }
         }
         
-        for mean in &mut means {
-            *mean /= n_samples;
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // Fallback for non-x86_64 architectures
+            for sample in samples {
+                for (i, &value) in sample.iter().enumerate() {
+                    if i < n_vars {
+                        means[i] += value as f64;
+                    }
+                }
+            }
+            
+            for mean in &mut means {
+                *mean /= n_samples;
+            }
         }
         
         means

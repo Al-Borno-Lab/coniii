@@ -4,7 +4,7 @@ use numpy::ndarray::Array2;
 
 // Import our core sampling logic
 mod core;
-use core::samplers::{IsingCore, Potts3Core, SamplerCore, generate_samples, calculate_means};
+use core::samplers::{IsingCore, Potts3Core, SamplerCore, generate_samples, generate_samples_parallel, calculate_means};
 
 /// Formats the sum of two numbers as string.
 #[pyfunction]
@@ -69,6 +69,12 @@ impl Ising {
     /// Generate multiple samples
     fn generate_sample(&mut self, n_samples: usize, burn_in: usize, steps: usize, verbose: bool) -> PyResult<()> {
         self.sample = generate_samples(&mut self.core, n_samples, burn_in, steps, verbose);
+        Ok(())
+    }
+
+    /// Generate multiple samples in parallel using Rayon
+    fn generate_sample_parallel(&mut self, n_samples: usize, burn_in: usize, steps: usize, verbose: bool) -> PyResult<()> {
+        self.sample = generate_samples_parallel(&self.core, n_samples, burn_in, steps, verbose);
         Ok(())
     }
     
@@ -196,6 +202,12 @@ impl Potts3 {
     /// Generate multiple samples
     fn generate_sample(&mut self, n_samples: usize, burn_in: usize, steps: usize, verbose: bool) -> PyResult<()> {
         self.sample = generate_samples(&mut self.core, n_samples, burn_in, steps, verbose);
+        Ok(())
+    }
+
+    /// Generate multiple samples in parallel using Rayon
+    fn generate_sample_parallel(&mut self, n_samples: usize, burn_in: usize, steps: usize, verbose: bool) -> PyResult<()> {
+        self.sample = generate_samples_parallel(&self.core, n_samples, burn_in, steps, verbose);
         Ok(())
     }
     
