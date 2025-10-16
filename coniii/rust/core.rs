@@ -233,17 +233,25 @@ pub mod samplers {
             for i in 0..(self.n - 1) {
                 // Field terms: different for each state (0, 1, 2)
                 if config[i] == 0 {
-                    energy -= self.multipliers[i];
+                    if i < self.multipliers.len() {
+                        energy -= self.multipliers[i];
+                    }
                 } else if config[i] == 1 {
-                    energy -= self.multipliers[i + self.n];
+                    if i + self.n < self.multipliers.len() {
+                        energy -= self.multipliers[i + self.n];
+                    }
                 } else {
-                    energy -= self.multipliers[i + 2*self.n];
+                    if i + 2*self.n < self.multipliers.len() {
+                        energy -= self.multipliers[i + 2*self.n];
+                    }
                 }
                 
                 // Coupling terms: delta function for same states
                 for j in (i+1)..self.n {
                     if config[i] == config[j] {
-                        energy -= self.multipliers[counter + 3*self.n];
+                        if counter + 3*self.n < self.multipliers.len() {
+                            energy -= self.multipliers[counter + 3*self.n];
+                        }
                     }
                     counter += 1;
                 }
@@ -251,11 +259,17 @@ pub mod samplers {
             
             // Last field term (for the last spin)
             if config[self.n - 1] == 0 {
-                energy -= self.multipliers[self.n - 1];
+                if self.n - 1 < self.multipliers.len() {
+                    energy -= self.multipliers[self.n - 1];
+                }
             } else if config[self.n - 1] == 1 {
-                energy -= self.multipliers[2*self.n - 1];
+                if 2*self.n - 1 < self.multipliers.len() {
+                    energy -= self.multipliers[2*self.n - 1];
+                }
             } else {
-                energy -= self.multipliers[3*self.n - 1];
+                if 3*self.n - 1 < self.multipliers.len() {
+                    energy -= self.multipliers[3*self.n - 1];
+                }
             }
             
             energy
