@@ -36,11 +36,22 @@ from itertools import chain
 from numba.typed import List
 
 from .utils import *
-try:
-    from .samplers_ext import BoostIsing, BoostPotts3
-    IMPORTED_SAMPLERS_EXT = True
-except ModuleNotFoundError:
-    IMPORTED_SAMPLERS_EXT = False
+# Check if Rust samplers are available
+def _check_rust_samplers():
+    try:
+        import coniii
+        return hasattr(coniii, 'Ising') and hasattr(coniii, 'Potts3')
+    except ImportError:
+        return False
+
+def _get_rust_samplers():
+    if _check_rust_samplers():
+        import coniii
+        return coniii.Ising, coniii.Potts3
+    return None, None
+
+def _is_rust_available():
+    return _check_rust_samplers()
 
 
 # ------------------------------------------------------------------------------- #
@@ -1175,27 +1186,27 @@ class Metropolis(Sampler):
         self.rng = rng or np.random.RandomState()
         self._samples = None
         
-        # use boost by default for Ising model
-        if boost and IMPORTED_SAMPLERS_EXT and self.theta.size==(n*(n-1)//2+n):
-            if iprint: warn("Assuming that the model is Ising.")
-            # use boost library for fast sampling
-            self.generate_sample = self.generate_sample_boost
-            self.generate_sample_parallel = self.generate_sample_parallel_boost
-            self.generate_cond_sample = self.generate_cond_sample_boost
+        # use Rust implementation by default for Ising model
+        if boost and _is_rust_available() and self.theta.size==(n*(n-1)//2+n):
+            if iprint: warn("Using Rust implementation for Ising model.")
+            # use Rust library for fast sampling
+            self.generate_sample = self.generate_sample_rust
+            self.generate_sample_parallel = self.generate_sample_parallel_rust
+            self.generate_cond_sample = self.generate_cond_sample_rust
         else:
             if boost and iprint:
-                warn("Boost C++ implementation not available. Defaulting to slower sampling methods.")
+                warn("Rust implementation not available. Defaulting to slower sampling methods.")
             assert not self.calc_e is None
             self.generate_sample = self.generate_sample_py
             self.generate_sample_parallel = self.generate_sample_parallel_py
             self.generate_cond_sample = self.generate_cond_sample_py
 
-    def generate_sample_boost(self,
+    def generate_sample_rust(self,
                                sample_size,
                                n_iters=1000,
                                burn_in=None,
                                systematic_iter=False):
-        """Generate Metropolis samples using C++ and boost.
+        """Generate Metropolis samples using Rust implementation.
 
         Parameters
         ----------
@@ -1217,12 +1228,13 @@ class Metropolis(Sampler):
         burn_in = burn_in or n_iters
         assert sample_size>0 and n_iters>-1 and burn_in>-1
         
-        bsampler = BoostIsing(self.n, self.theta, int(self.rng.randint(0, 2**31-1)))
-        bsampler.generate_sample(sample_size,
-                                 burn_in,
-                                 n_iters,
-                                 systematic_iter)
-        self.sample = bsampler.fetch_sample().astype(int)
+        RustIsing, _ = _get_rust_samplers()
+        rust_sampler = RustIsing(self.n, self.theta.tolist(), seed=int(self.rng.randint(0, 2**31-1)))
+        rust_sampler.generate_sample(n_samples=sample_size,
+                                     burn_in=burn_in,
+                                     steps=n_iters,
+                                     verbose=False)
+        self.sample = rust_sampler.fetch_sample().astype(int)
     
     def generate_sample_py(self,
                             sample_size,
@@ -1322,12 +1334,12 @@ class Metropolis(Sampler):
                     self.sample[i,:] = self._samples[:]
                     self.E[i] = E
 
-    def generate_sample_parallel_boost(self,
+    def generate_sample_parallel_rust(self,
                                         sample_size,
                                         n_iters=1000,
                                         burn_in=None,
                                         systematic_iter=False):
-        """Generate samples in parallel. Each replica in self._samples runs on its own thread
+        """Generate samples in parallel using Rust implementation. Each replica runs on its own thread
         and a sample is generated every n_iters.
 
         In order to control the random number generator, we pass in seeds that are samples
@@ -1348,19 +1360,14 @@ class Metropolis(Sampler):
         
         burn_in = burn_in or n_iters
 
-        # Parallel sample. Each thread needs to return sample_size/n_cpus samples.
-        def f(args, n=self.n, multipliers=self.theta):
-            sample_size, seed = args
-            bsampler = BoostIsing(n, multipliers, int(seed))
-            bsampler.generate_sample(sample_size, burn_in, n_iters, systematic_iter)
-            return bsampler.fetch_sample().astype(int)
-        
-        with mp.Pool() as pool:
-            n_cpus = mp.cpu_count()
-            self.sample = np.vstack( list(pool.map(f, zip([int(np.ceil(sample_size/n_cpus))]*n_cpus,
-                                                            self.rng.randint(2**31-1, size=n_cpus)))) )
-
-        self.sample = np.vstack(self.sample)[:sample_size]
+        # Use Rust parallel sampling directly
+        RustIsing, _ = _get_rust_samplers()
+        rust_sampler = RustIsing(self.n, self.theta.tolist(), seed=int(self.rng.randint(0, 2**31-1)))
+        rust_sampler.generate_sample_parallel(n_samples=sample_size,
+                                             burn_in=burn_in,
+                                             steps=n_iters,
+                                             verbose=False)
+        self.sample = rust_sampler.fetch_sample().astype(int)
 
     def generate_sample_parallel_py(self,
                                      sample_size,
@@ -1445,7 +1452,7 @@ class Metropolis(Sampler):
         self.sample = np.vstack(self.sample)[:sample_size]
         self._samples = np.vstack(self._samples)
 
-    def generate_cond_sample_boost(self,
+    def generate_cond_sample_rust(self,
                                    sample_size,
                                    fixed_subset,
                                    burn_in=1000,
@@ -1453,7 +1460,7 @@ class Metropolis(Sampler):
                                    initial_sample=None,
                                    systematic_iter=False,
                                    parallel=True):
-        """Generate samples from conditional distribution (while a subset of the spins are
+        """Generate samples from conditional distribution using Rust implementation (while a subset of the spins are
         held fixed).
 
         Parameters
@@ -1486,39 +1493,11 @@ class Metropolis(Sampler):
         assert (np.diff(fixed_subset_[0]) > 0).all()
         assert frozenset((-1,1)) >= set(fixed_subset_[1])
 
-        # reformat for C++ module, note that Boost still relies on 32-bit ints
-        fixed_subset = list(zip(*fixed_subset))
-        fixed_subset = np.array(fixed_subset[0], dtype=np.int32), np.array(fixed_subset[1], dtype=np.int32)
-        assert (np.diff(fixed_subset[0]) > 0).all()
-        assert frozenset((-1,1)) >= set(fixed_subset[1].tolist())
-       
-        if not parallel:
-            bsampler = BoostIsing(self.n, self.theta, int(self.rng.randint(0, 2**31-1)))
-            bsampler.generate_cond_sample(fixed_subset[0],
-                                          fixed_subset[1],
-                                          sample_size,
-                                          burn_in,
-                                          n_iters,
-                                          systematic_iter)
-            self.sample = bsampler.fetch_sample().astype(int)
-        else:
-            # Parallel sample. Each thread needs to return sample_size/n_cpus samples.
-            def f(args, n=self.n, multipliers=self.theta):
-                sample_size, seed = args
-                bsampler = BoostIsing(n, multipliers, int(seed))
-                bsampler.generate_cond_sample(fixed_subset[0],
-                                              fixed_subset[1],
-                                              sample_size,
-                                              burn_in,
-                                              n_iters,
-                                              systematic_iter)
-                return bsampler.fetch_sample().astype(int)
-            
-            n_cpus = mp.cpu_count()
-            with mp.Pool() as pool:
-                self.sample = np.vstack( list(pool.map(f, zip([int(np.ceil(sample_size/n_cpus))]*n_cpus,
-                                                                self.rng.randint(2**31-1, size=n_cpus)))) )
-            self.sample = np.vstack(self.sample)[:sample_size]
+        # For now, fall back to Python implementation for conditional sampling
+        # as our Rust implementation doesn't support conditional sampling yet
+        warn("Conditional sampling not yet implemented in Rust. Falling back to Python implementation.")
+        return self.generate_cond_sample_py(sample_size, fixed_subset, burn_in, n_iters, 
+                                          initial_sample, systematic_iter, parallel)
 
     def generate_cond_sample_py(self,
                                 sample_size,
@@ -1802,26 +1781,59 @@ class Potts3(Metropolis):
         self.rng = rng or np.random.RandomState()
         self._samples = None
         
-        # use boost by default
-        if boost and IMPORTED_SAMPLERS_EXT:
-            self.bsampler = BoostPotts3(n, theta, self.rng.randint(2**31-1))
-
-            # use boost library for fast sampling
-            self.generate_sample = self.generate_sample_boost
-            self.generate_sample_parallel = self.generate_sample_parallel_boost
+        # use Rust implementation by default
+        if boost and _is_rust_available():
+            # use Rust library for fast sampling
+            self.generate_sample = self.generate_sample_rust
+            self.generate_sample_parallel = self.generate_sample_parallel_rust
         else:
             if boost:
-                warn("Boost library not available. Defaulting to slower sampling methods.")
+                warn("Rust implementation not available. Defaulting to slower sampling methods.")
             assert not self.calc_e is None
             self.generate_sample = self.generate_sample_py
             self.generate_sample_parallel = self.generate_sample_parallel_py
 
-    def generate_sample_parallel_boost(self,
+    def generate_sample_rust(self,
+                              sample_size,
+                              n_iters=1000,
+                              burn_in=None,
+                              systematic_iter=False):
+        """Generate Metropolis samples using Rust implementation.
+
+        Parameters
+        ----------
+        sample_size : int
+            Number of samples.
+        n_iters : int, 1000
+            Number of Metropolis iterations between samples.
+        burn_in : int, None
+            If not set, will be the same value as n_iters.
+        systematic_iter : bool, False
+            If True, iterate through each element of system by increment index by one. 
+
+        Returns
+        -------
+        ndarray, optional
+            Saved array of energies at each sampling step.
+        """
+        
+        burn_in = burn_in or n_iters
+        assert sample_size>0 and n_iters>-1 and burn_in>-1
+        
+        _, RustPotts3 = _get_rust_samplers()
+        rust_sampler = RustPotts3(self.n, self.theta.tolist(), seed=int(self.rng.randint(0, 2**31-1)))
+        rust_sampler.generate_sample(n_samples=sample_size,
+                                     burn_in=burn_in,
+                                     steps=n_iters,
+                                     verbose=False)
+        self.sample = rust_sampler.fetch_sample().astype(int)
+
+    def generate_sample_parallel_rust(self,
                                         sample_size,
                                         n_iters=1000,
                                         burn_in=None,
                                         systematic_iter=False):
-        """Generate samples in parallel. Each replica in self._samples runs on its own thread
+        """Generate samples in parallel using Rust implementation. Each replica runs on its own thread
         and a sample is generated every n_iters.
 
         In order to control the random number generator, we pass in seeds that are samples
@@ -1841,23 +1853,15 @@ class Potts3(Metropolis):
         """
         
         burn_in = burn_in or n_iters
-        n_cpus = self.nCpus  # alias
-        assert n_cpus>=2, "Sampler is not set up for multiprocessing, nCpus<=1."
-        assert sample_size>n_cpus, "Parallelization only helps if many samples are generated per thread."
 
-        # Parallel sample. Each thread needs to return sample_size/n_cpus samples.
-        def f(args, n=self.n, multipliers=self.theta):
-            nSamples, seed = args
-            bsampler = BoostPotts3(n, multipliers, int(seed))
-            bsampler.generate_sample(nSamples, burn_in, n_iters, systematic_iter)
-            return bsampler.fetch_sample().astype(int)
-        
-        pool = mp.Pool(n_cpus)
-        self.sample = np.vstack( list(pool.map(f, zip([int(np.ceil(sample_size/n_cpus))]*n_cpus,
-                                                        self.rng.randint(2**31-1, size=n_cpus)))) )
-        pool.close()
-
-        self.sample = np.vstack(self.sample)[:sample_size]
+        # Use Rust parallel sampling directly
+        _, RustPotts3 = _get_rust_samplers()
+        rust_sampler = RustPotts3(self.n, self.theta.tolist(), seed=int(self.rng.randint(0, 2**31-1)))
+        rust_sampler.generate_sample_parallel(n_samples=sample_size,
+                                             burn_in=burn_in,
+                                             steps=n_iters,
+                                             verbose=False)
+        self.sample = rust_sampler.fetch_sample().astype(int)
 
     def sample_metropolis(self, sample0, E0,
                           rng=None,
@@ -2414,7 +2418,7 @@ def sample_ising(multipliers, n_samples,
                  seed=None,
                  parallel=True,
                  generate_sample_kw={}):
-    """Easy way to Metropolis sample from Ising model.
+    """Easy way to Metropolis sample from Ising model using Rust implementation.
 
     Parameters
     ----------
@@ -2444,20 +2448,42 @@ def sample_ising(multipliers, n_samples,
     else:
         multipliers = np.array(multipliers)
 
-    rng = np.random.RandomState(seed=seed)
     n = 0.5 * (-1 + np.sqrt(1 + 8*len(multipliers)) )
     assert n == int(n),"The length of multipliers vector does not correspond to an integer number of spins."
     
-    calc_e = define_ising_helper_functions()[0]
-
-    sampler = Metropolis(int(n), multipliers,
-                         rng=rng,
-                         iprint=False,
-                         calc_e=calc_e)
-    
-    # generate samples
-    if parallel:
-        sampler.generate_sample_parallel(n_samples, **generate_sample_kw)
+    # Use Rust implementation directly if available
+    if _is_rust_available():
+        RustIsing, _ = _get_rust_samplers()
+        rust_sampler = RustIsing(int(n), multipliers.tolist(), seed=seed)
+        
+        # Convert parameters to Rust format
+        n_iters = generate_sample_kw.get('n_iters', 1000)
+        burn_in = generate_sample_kw.get('burn_in', n_iters)
+        
+        if parallel:
+            rust_sampler.generate_sample_parallel(n_samples=n_samples, 
+                                                burn_in=burn_in, 
+                                                steps=n_iters, 
+                                                verbose=False)
+        else:
+            rust_sampler.generate_sample(n_samples=n_samples, 
+                                       burn_in=burn_in, 
+                                       steps=n_iters, 
+                                       verbose=False)
+        return rust_sampler.fetch_sample()
     else:
-        sampler.generate_sample(n_samples, **generate_sample_kw)
-    return sampler.sample
+        # Fall back to Python implementation
+        rng = np.random.RandomState(seed=seed)
+        calc_e = define_ising_helper_functions()[0]
+
+        sampler = Metropolis(int(n), multipliers,
+                             rng=rng,
+                             iprint=False,
+                             calc_e=calc_e)
+        
+        # generate samples
+        if parallel:
+            sampler.generate_sample_parallel(n_samples, **generate_sample_kw)
+        else:
+            sampler.generate_sample(n_samples, **generate_sample_kw)
+        return sampler.sample
