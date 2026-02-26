@@ -33,7 +33,7 @@ import platform, sys
 
 
 # flags
-NO_BOOST = False
+NO_BOOST = True
 
 # default args (that are modified per system specs below)
 EXTRA_COMPILE_ARGS = ['-std=c++11',f'-I{sys.prefix}/include']
